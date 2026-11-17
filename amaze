@@ -8,7 +8,8 @@ __author__ = "Michael Zevin <michael.j.zevin@gmail.com>"
 __contributors__ = [
     "Storm Colloms <>",
     "Chris Pankow <>",
-    "April Cheng <>"
+    "April Cheng <>",
+    "August Muller <>"
 ]
 
 # --- Import packages --- #
@@ -90,7 +91,10 @@ def amaze(args):
     if verbose:
         print("\nFormation channels: [" + ", ".join(channels)+"]\n")
         print("Astrophysical models: [" + ", ".join(model_names)+"]\n")
-        print("Parameters for inference: [" + ", ".join(settings['population-parameter-dict'])+"]\n\n")
+        if settings['infer-rate']: 
+            print("Parameters for inference: [" + ", ".join(settings['population-parameter-dict'],"N")+"]\n\n")
+        else: 
+            print("Parameters for inference: [" + ", ".join(settings['population-parameter-dict'])+"]\n\n")
 
     # --- Perform some checks to make sure everything is compatible
     helper_functions.ErrorCheckModels(model_names, channels, \
@@ -269,6 +273,7 @@ def amaze(args):
     # Initialize sampler class
     sampler = sample.Sampler(model_names=model_names, \
                                 pop_param_dict = settings['population-parameter-dict'], \
+                                infer_rate = settings['infer-rate'], \
                                 use_flows = settings['use-flows'], \
                                 continuous_sampling = settings['continuous-sampling'], \
                                 nwalkers=settings['n-walkers'], \

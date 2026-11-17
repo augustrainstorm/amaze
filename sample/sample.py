@@ -33,7 +33,7 @@ class Sampler(object):
     """
     Sampler class.
     """
-    def __init__(self, model_names, pop_param_dict, use_flows, \
+    def __init__(self, model_names, pop_param_dict, infer_rate, use_flows, \
                  continuous_sampling, **kwargs):
         """
         model_names : list of str
@@ -41,6 +41,8 @@ class Sampler(object):
             'CE/chi00/alpha02' or 'SMT/chi00'
         pop_param_dict : dictionary
             contains infor about population hyperparameters
+        infer_rate : bool
+            indicates whether to infer the overall rate of events
         use_flows : bool
             indicates whether normalizing flows are being used instead of KDEs
         continuous_sampling : bool
@@ -70,12 +72,17 @@ class Sampler(object):
         # note that ndim is (Nchannels-1) + Nhyper for the model indices -- branching fractions minus 1 plus number of hyperparams
         ndim = (len(channels)-1) + Nhyper
 
+        # add additional dimension if also inferring the overall rate N
+        if infer_rate:
+            ndim = ndim+1
+
         # store as attributes
         self.Nhyper = Nhyper
         self.model_names = model_names
         self.channels = channels
         self.ndim = ndim
         self.submodels_dict = submodels_dict
+        self.infer_rate = infer_rate
         self.use_flows = use_flows
         self.continuous_sampling = continuous_sampling
 
@@ -140,20 +147,32 @@ class Sampler(object):
             #ndim encompasses the population hyperparameters and the branching fractions between channels
         p0 = np.empty(shape=(self.nwalkers, self.ndim))
 
-        # first, for the population hyperparameters
-        #selects points in uniform prior over hyperparameter indices (discrete case) or transformed hyperparameter values (continuous case)
-        for hpidx in range(self.Nhyper):
-            p0[:,hpidx] = np.random.uniform(self.hyperparam_bounds[hpidx][0], self.hyperparam_bounds[hpidx][1], size=self.nwalkers)
-        # second, for the branching fractions (we have Nchannel-1 betasin the inference because of the implicit constraint that Sum(betas) = 1
-        _concentration = np.ones(len(self.channels))
-        beta_p0 =  dirichlet.rvs(_concentration, p0.shape[0])
-        p0[:,self.Nhyper:] = beta_p0[:,:-1]
+        if self.infer_rate:
+            # first, for the rate parameter
+            p0[:,0] = #TODO
+            # second, for the population hyperparameters
+            #selects points in uniform prior over hyperparameter indices (discrete case) or transformed hyperparameter values (continuous case)
+            for hpidx in range(self.Nhyper):
+                p0[:,hpidx+1] = np.random.uniform(self.hyperparam_bounds[hpidx][0], self.hyperparam_bounds[hpidx][1], size=self.nwalkers)
+            # third, for the branching fractions (we have Nchannel-1 betasin the inference because of the implicit constraint that Sum(betas) = 1
+            _concentration = np.ones(len(self.channels))
+            beta_p0 =  dirichlet.rvs(_concentration, p0.shape[0])
+            p0[:,self.Nhyper+1:] = beta_p0[:,:-1]
+        else:
+            # first, for the population hyperparameters
+            #selects points in uniform prior over hyperparameter indices (discrete case) or transformed hyperparameter values (continuous case)
+            for hpidx in range(self.Nhyper):
+                p0[:,hpidx] = np.random.uniform(self.hyperparam_bounds[hpidx][0], self.hyperparam_bounds[hpidx][1], size=self.nwalkers)
+            # second, for the branching fractions (we have Nchannel-1 betasin the inference because of the implicit constraint that Sum(betas) = 1
+            _concentration = np.ones(len(self.channels))
+            beta_p0 =  dirichlet.rvs(_concentration, p0.shape[0])
+            p0[:,self.Nhyper:] = beta_p0[:,:-1]
 
         # --- Do the sampling
         #set arguments to pass to self.posterior
         posterior_args = [obsdata, models, self.submodels_dict, self.channels, \
                 prior_pdf, self.hyperparam_bounds, self.use_flows, self.continuous_sampling, \
-                smallest_N, _concentration, device]
+                smallest_N, _concentration, device, self.infer_rate]
 
         #load previous steps from backend if it exists
         if os.path.exists(f'{outdir}/emcee_backend_seed{random_seed}.hdf5'):
@@ -226,7 +245,7 @@ def lnp(x, submodels_dict, _concentration, hyperparam_bounds, \
 
 
 def lnlike(x, data, models, submodels_dict, channels, prior_pdf, \
-           use_flows, continuous_sampling, smallest_N, device, **kwargs):
+           use_flows, continuous_sampling, smallest_N, device, infer_rate, **kwargs):
     """
     Log of the likelihood for model selection, using either KDEs or normalising flows. 
     Selects on model, then tests beta.
@@ -253,6 +272,9 @@ def lnlike(x, data, models, submodels_dict, channels, prior_pdf, \
     smallest_N : int
         Value by which to regularise the population distributions.
         See eq. 2 in Colloms et al.
+    infer_rate : bool
+            indicates whether to infer the overall rate of events
+
     Returns
         log likelihood summed over events, accounting for detection efficiency
     """
@@ -306,12 +328,15 @@ def lnlike(x, data, models, submodels_dict, channels, prior_pdf, \
             lnprob = logsumexp([lnprob, np.log(beta) + np.log(smdl(data, smallest_N, data_prior=prior_pdf))], axis=0)
             alpha += beta * smdl.alpha
 
-    #returns lnprob summed over events (probability multiplied over events - see one channel eq D13 for full likelihood calc)
-    return (lnprob-np.log(alpha)).sum()
+    #returns lnprob summed over events (probability multiplied over events - see one channel eq D13 (now D8?) for full likelihood calc)
+    if infer_rate:
+        return (lnprob-np.log(alpha)).sum() #TODO: add rate term to the end of this if using
+    else: 
+        return (lnprob-np.log(alpha)).sum() 
 
 
 def lnpost(x, data, models, submodels_dict, channels, prior_pdf, hyperparam_bounds, \
-           use_flows, continuous_sampling, smallest_N, _concentration, device):
+           use_flows, continuous_sampling, smallest_N, _concentration, device, infer_rate):
     """
     Combines the prior and likelihood to give a log posterior probability 
     at a given point
@@ -340,6 +365,8 @@ def lnpost(x, data, models, submodels_dict, channels, prior_pdf, hyperparam_boun
         See eq. 2 in Colloms et al.
     _concentration: list
         concentration to use for Dirichlet prior on Betas
+    infer_rate : bool
+            indicates whether to infer the overall rate of events
 
     Returns
         log likelihood plus log prior
@@ -351,8 +378,8 @@ def lnpost(x, data, models, submodels_dict, channels, prior_pdf, hyperparam_boun
         return log_prior
 
     # Likelihood
-    log_like = lnlike(x, data, models, submodels_dict, channels, \
-                      prior_pdf, use_flows, continuous_sampling, smallest_N, device)
+    log_like = lnlike(x, data, models, submodels_dict, channels, prior_pdf, \
+                      use_flows, continuous_sampling, smallest_N, device, infer_rate)
                       
     log_post = log_prior + log_like
     
