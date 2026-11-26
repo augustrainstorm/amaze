@@ -9,6 +9,7 @@ from functools import partial
 import warnings
 import pdb
 import json
+from itertools import product
 
 import numpy as np
 import scipy as sp
@@ -23,6 +24,8 @@ from .population_utils.flow import NFlow
 from .population_utils.bounded_Nd_kde import Bounded_Nd_kde
 from .population_utils.transform import mtotq_to_mchirp, mtoteta_to_mchirpq, eta_to_q, mchirpq_to_m1m2
 from .population_utils.selection_effects import projection_factor_Dominik2015_interp, _PSD_defaults
+from poplar.nn.networks import LinearModel
+from poplar.nn.networks import load_model as load_deteff_model
 
 from astropy import cosmology
 from astropy.cosmology import z_at_value
@@ -65,37 +68,38 @@ class Model(object):
             if 'pdet_'+sensitivity not in samples.columns:
                 raise ValueError(f"{sensitivity} was specified for your detection weights, but cannot find the column 'pdet_{sensitivity}' in the samples datafarme!")
 
-            if multisensitivity:
-                #calculate average pdet to use for detection efficiency
-                latest_run = sensitivity.split('_')[0] #extract run from sensitivity key
-                obs_times = {'O1':{'start':1126051217, 'end':1137196817, 'det':['H1','L1']},\
-                            'O2':{'start':1164499217, 'end':1187654418, 'det':['H1','L1','V1']},\
-                            'O3a':{'start':1238112018, 'end':1253923218, 'det':['H1','L1','V1']},\
-                            'O3b':{'start':1256601618, 'end':1269302418, 'det':['H1','L1','V1']},\
-                            'O4a':{'start':1368975618, 'end':1389456018, 'det':['H1','L1']},\
-                            'O4b':{'start':1396796418, 'end':1422118818, 'det':['H1','L1','V1']},\
-                            }
-                if latest_run not in obs_times:
-                    raise ValueError(f"{sensitivity} was specified for your detection weights, but the sensitivity must start with one of {list(obs_times.keys())} if multisensitivity is specified")
-                #find observing runs up until the specified observing run
-                obsruns = np.array(list(obs_times))
-                obsruns = obsruns[:np.argwhere(obsruns==latest_run).reshape(-1)[0]+1]
-
-                #lengths of each observing run
-                cumul_obs_times = {r: obs_times[r] for r in obsruns}
-                obs_lengths = [(cumul_obs_times[OR]['end']-cumul_obs_times[OR]['start']) for OR in list(cumul_obs_times)]
-
-                pdet_keys = [f'pdet_{run}{sensitivity[len(latest_run):]}' for run in obsruns]
-                all_pdets = np.array(samples[pdet_keys])
-                #find ave pdets over all previous runs
-                pdets = np.sum(all_pdets*obs_lengths, axis=1)/np.sum(obs_lengths)
             else:
-                pdets=samples['pdet_'+sensitivity]
-            # if cosmological weights are provided, do weighted average of pdet
-            if 'weight' in samples.keys():
-                alpha = np.sum(pdets*samples['weight']) / np.sum(samples['weight'])
-            else:
-                alpha = np.sum(pdets) / len(samples)
+                if multisensitivity:
+                    #calculate average pdet to use for detection efficiency
+                    latest_run = sensitivity.split('_')[0] #extract run from sensitivity key
+                    obs_times = {'O1':{'start':1126051217, 'end':1137196817, 'det':['H1','L1']},\
+                                'O2':{'start':1164499217, 'end':1187654418, 'det':['H1','L1','V1']},\
+                                'O3a':{'start':1238112018, 'end':1253923218, 'det':['H1','L1','V1']},\
+                                'O3b':{'start':1256601618, 'end':1269302418, 'det':['H1','L1','V1']},\
+                                'O4a':{'start':1368975618, 'end':1389456018, 'det':['H1','L1']},\
+                                'O4b':{'start':1396796418, 'end':1422118818, 'det':['H1','L1','V1']},\
+                                }
+                    if latest_run not in obs_times:
+                        raise ValueError(f"{sensitivity} was specified for your detection weights, but the sensitivity must start with one of {list(obs_times.keys())} if multisensitivity is specified")
+                    #find observing runs up until the specified observing run
+                    obsruns = np.array(list(obs_times))
+                    obsruns = obsruns[:np.argwhere(obsruns==latest_run).reshape(-1)[0]+1]
+
+                    #lengths of each observing run
+                    cumul_obs_times = {r: obs_times[r] for r in obsruns}
+                    obs_lengths = [(cumul_obs_times[OR]['end']-cumul_obs_times[OR]['start']) for OR in list(cumul_obs_times)]
+
+                    pdet_keys = [f'pdet_{run}{sensitivity[len(latest_run):]}' for run in obsruns]
+                    all_pdets = np.array(samples[pdet_keys])
+                    #find ave pdets over all previous runs
+                    pdets = np.sum(all_pdets*obs_lengths, axis=1)/np.sum(obs_lengths)
+                else:
+                    pdets=samples['pdet_'+sensitivity]
+                # if cosmological weights are provided, do weighted average of pdet
+                if 'weight' in samples.keys():
+                    alpha = np.sum(pdets*samples['weight']) / np.sum(samples['weight'])
+                else:
+                    alpha = np.sum(pdets) / len(samples)
         else:
             alpha = 1.0
         return alpha
@@ -545,7 +549,7 @@ def scale_to_unity(bounds):
 
 class FlowModel(Model):
     @staticmethod
-    def from_samples(channel, samples, param_dict, channel_hyperparams, smdl_indxs_combos, sensitivity=None, multisensitivity=True):
+    def from_samples(channel, samples, param_dict, channel_hyperparams, smdl_indxs_combos, sensitivity=None, multisensitivity=True, deteff_model_path=None, hps_by_indx=False):
         """
         Generate a normalising flow model instance from `samples`, where the keys in `params_dict` are a series in the `samples` dataframe. 
         
@@ -571,6 +575,15 @@ class FlowModel(Model):
             Desired detector sensitivity consistent with the string following the `pdet` and `snropt` columns in the population dataframes.
             Used to construct a detection-weighted population model, as well as for drawing samples from the underlying population
             to calculate the detection efficiency
+        multisensitivity : bool
+            If True, calculates the detection efficiency by finding the average pdet over any previous observing run, weighted by the fractional observing time.
+            If False, only uses pdet at specified sensitivity.
+        deteff_model_path : str or None
+            The path to neural network models to use for detection efficiency interpolation. 
+            If None, falls back to a pchip interpolation across detection efficiencies evaluated at input population samples.
+        hps_by_indx : bool
+            If True, expects the hyperparameters to be associated to indices in the input population samples. 
+            If False, expects the hyperparameters to lie on a grid and associated with hierarchical keys in the input file.
         
         Returns
         ----------
@@ -587,7 +600,9 @@ class FlowModel(Model):
 
         for model_idxs in model_keys:
             #grab samples for each submodel according to key in samples dict
-            if model_idxs.ndim > 0:
+            if len(model_keys)==1:
+                dict_key = tuple(model_idxs)
+            elif model_idxs.ndim > 0:
                 dict_key = tuple(model_idxs)
             else:
                 dict_key = model_idxs
@@ -609,14 +624,19 @@ class FlowModel(Model):
                 cosmo_weights[dict_key] = np.ones(len(sbml_samps))
 
             # Normalise the cosmological weights. If wanted detection weighted samples, cosmo weigths could be combined with pdets
-            if (cosmo_weights[dict_key] is not None):
+            if 'weight' in sbml_samps.keys():
                 combined_weights[dict_key] = (cosmo_weights[dict_key] / np.sum(cosmo_weights[dict_key]))
             else:
                 combined_weights[dict_key] = np.ones(len(sbml_samps))
-        return FlowModel(channel, samples, param_dict, channel_hyperparams, combined_weights, alpha, model_keys)
+            
+        if deteff_model_path is not None:
+            latest_run = sensitivity.split('_')[0]
+            deteff_model_path=f'{deteff_model_path}/{channel}_{latest_run}/model.pth'
+
+        return FlowModel(channel, samples, param_dict, channel_hyperparams, combined_weights, alpha, model_keys, deteff_model_path, hps_by_indx)
 
 
-    def __init__(self, channel, samples, param_dict, channel_hyperparams, combined_weights, alpha, model_keys):
+    def __init__(self, channel, samples, param_dict, channel_hyperparams, combined_weights, alpha, model_keys, deteff_model_path, hps_by_indx):
         """
         Initialisation for FlowModel object.
         Parameters
@@ -638,6 +658,12 @@ class FlowModel(Model):
             detection efficiency values for each submodel
         model_keys : list
             The combinations of hyperparameter indices used as keys in the samples, combined_weights, and alpha dictionaries
+        deteff_model_path : str or None
+            The path to neural network models to use for detection efficiency interpolation. 
+            If None, falls back to a pchip interpolation across detection efficiencies evaluated at input population samples.
+        hps_by_indx : bool
+            If True, expects the hyperparameters to be associated to indices in the input population samples. 
+            If False, expects the hyperparameters to lie on a grid and associated with hierarchical keys in the input file.
         """
 
         super()
@@ -657,6 +683,10 @@ class FlowModel(Model):
                 self.hp_vals.append(list(np.log(list(channel_hyperparams[hp]['values'].values()))))
             else:
                 self.hp_vals.append(list(channel_hyperparams[hp]['values'].values()))
+        
+        if hps_by_indx==True:
+            self.hp_vals = np.array(self.hp_vals)
+        self.hps_by_indx = hps_by_indx
 
         #number of binary parameters
         self.no_params = len(param_dict.keys())
@@ -666,6 +696,28 @@ class FlowModel(Model):
         #set weights and detection efficienies as class properties
         self.combined_weights = combined_weights
         self.alpha = alpha
+        if deteff_model_path is not None:
+            self.deteff_nn_interp = True
+            print(f'Using SNRflow interpolation for detection efficiency, with models from {deteff_model_path}')
+            #print(channel, deteff_model_path)
+            self.alpha_interp = load_deteff_model(deteff_model_path, device='cpu')
+        else:
+            print('Using Pchip interpolation for detection efficiency')
+            self.deteff_nn_interp = False
+            if hps_by_indx==True:
+                hp_grid_shape = self.hp_vals.shape[1]
+                alpha_grid = np.reshape(tuple(alpha.values()), (hp_grid_shape))
+                #initialise interpolator over hyperparameters to interpolate log(detection efficiency)
+                self.alpha_interp = sp.interpolate.LinearNDInterpolator((self.hp_vals.T), np.log(alpha_grid))
+            else:
+                hp_grid_shape = [len(self.hyperparam_models[i]) for i in range(len(self.hyperparam_models))]
+                alpha_grid = np.reshape(tuple(alpha.values()), (hp_grid_shape))
+
+                #initialise interpolator over hyperparameters to interpolate log(detection efficiency)
+                self.alpha_interp = sp.interpolate.RegularGridInterpolator((self.hp_vals), np.log(alpha_grid),\
+                    bounds_error=False, method='pchip', fill_value=None)
+        #reshape detection efficiency values onto grid the shape of hyperparameter values
+        
 
         #initialise the keys for the samples dicts and how many training submodels exist for this channel
         self.model_keys = model_keys
@@ -734,11 +786,19 @@ class FlowModel(Model):
                         wholedataset=True, rescale_max=self.param_dict[param]['limits'][1])
                 elif self.param_dict[param]['transf'] == 'tanh':
                     models_stack[:,pidx] = np.arctanh(models_stack[:,pidx])
+                elif self.param_dict[param]['transf'] == 'loglogit':
+                    rmax=np.log(self.param_dict[param]['limits'][1])+np.abs(np.min(np.log(models_stack[:,pidx])))+0.001
+                    models_stack[:,pidx], self.param_dict[param]['logit_max'], self.param_dict[param]['max'] = self.logistic(np.log(models_stack[:,pidx])+np.abs(np.min(np.log(models_stack[:,pidx])))+0.001,\
+                        wholedataset=True, rescale_max=rmax)
             except:
                 raise KeyError(f'Must specify how to transform {param} with `transf` entry in `event-parameter-dict`.')
-
-        #repeat subpopulation hyperparameter values Nsamps times for each combination of hyperparameter values
-        hp_combos = np.squeeze(list(product(*self.hp_vals)))
+        
+        if self.hps_by_indx==True:
+            hp_combos = np.array(self.hp_vals) .T
+        else:
+            #repeat subpopulation hyperparameter values Nsamps times for each combination of hyperparameter values, assuming self.hp_vals lies on a grid
+            hp_combos = np.squeeze(list(product(*self.hp_vals)))
+        hp_combos = hp_combos.reshape(-1,self.conditionals)
         hps_stack = np.repeat(hp_combos, (model_size).astype(int), axis=0)
 
         #reshape conditionals and weights
@@ -750,8 +810,8 @@ class FlowModel(Model):
                 train_test_split(models_stack, weights, hps_stack, shuffle=True, train_size=0.8)
 
         #concatenate training and validation data in order: samples, hyperparameters, weights
-        training_data = np.concatenate((train_models_stack, training_hps_stack, train_weights), axis=1)
-        val_data = np.concatenate((validation_models_stack, validation_hps_stack, validation_weights), axis=1)
+        training_data = [train_models_stack, training_hps_stack, train_weights]
+        val_data = [validation_models_stack, validation_hps_stack, validation_weights]
 
         return(training_data, val_data)
 
@@ -781,13 +841,16 @@ class FlowModel(Model):
                 samps[:,pidx] = self.expistic(logit_samps[:,pidx], self.param_dict[param]['logit_max'], self.param_dict[param]['max'])
             elif self.param_dict[param]['transf'] == 'tanh':
                 samps[:,pidx] = np.tanh(logit_samps[:,pidx])
+            elif self.param_dict[param]['transf'] == 'loglogit':
+                bonus_factor = self.param_dict[param]['max'] - np.log(self.param_dict[param]['limits'][1])
+                samps[:,pidx] = np.exp(self.expistic(logit_samps[:,pidx], self.param_dict[param]['logit_max'], self.param_dict[param]['max'])-bonus_factor)
             else:
                 print(f'No transformation type specified for {param} dimension, attempting expistic transform')
                 samps[:,pidx] = self.expistic(logit_samps[:,pidx], self.param_dict[param]['logit_max'], self.param_dict[param]['max'])
 
         return samps
 
-    def __call__(self, data, conditional_hps, smallest_N, data_prior=None, device='cpu'):
+    def __call__(self, data, conditional_hps, smallest_N, data_prior=None, device='cpu', sum_over_samps=True):
         """
         Calculate the regularised likelihood of the observations give some hyperparameters.
         This is used to calculate the hyperlikelihood.
@@ -815,7 +878,7 @@ class FlowModel(Model):
         likelihood = torch.ones(data.shape[0]) * -torch.inf
         likelihood=likelihood.to(device)
 
-        #maps observations into the logistically mapped space
+        #maps observations into the logistically mapped space and set to class attribute
         if self.data is None:
             self.mapped_obs = np.zeros_like(data)
             #map PE samples apart from nan samples, then ensure mapped_samples is reshaped to data.shape
@@ -853,12 +916,15 @@ class FlowModel(Model):
         self.log_prior[torch.isnan(self.log_prior)]=0
         likelihoods_per_samp = likelihoods_per_samp - self.log_prior
 
-        #adds likelihoods from samples together and then sums over events, normalise by number of samples
-        #likelihood in shape [Nobs x Nwalkers]
-        likelihood = torch.logsumexp(torch.stack([likelihood, torch.logsumexp(likelihoods_per_samp, axis=1) - torch.tensor(self.no_obs_samps).to(device).log()]), axis=0)
-        likelihood_cpu = likelihood.cpu().numpy()
+        if sum_over_samps:
+            #adds likelihoods from samples together and then sums over events, normalise by number of samples
+            #likelihood in shape [Nobs x Nwalkers]
+            likelihood = torch.logsumexp(torch.stack([likelihood, torch.logsumexp(likelihoods_per_samp, axis=1) - torch.tensor(self.no_obs_samps).to(device).log()]), axis=0)
+            likelihood_cpu = likelihood.cpu().numpy()
 
-        return likelihood_cpu
+            return likelihood_cpu
+        else:
+            return likelihoods_per_samp.cpu().numpy()
 
     def get_latent_samps(self, samps, conditional):
         """
@@ -907,6 +973,9 @@ class FlowModel(Model):
                 mapped_data[:,pidx],_,_ = self.logistic(data[:,pidx], False, self.param_dict[param]['logit_max'], self.param_dict[param]['max'])
             elif self.param_dict[param]['transf'] == 'tanh':
                 mapped_data[:,pidx] = np.arctanh(data[:,pidx])
+            elif self.param_dict[param]['transf'] == 'loglogit':
+                mapped_data[:,pidx], _,_ = self.logistic(np.log(mapped_data[:,pidx])+bonus_factor,\
+                    False, self.param_dict[param]['logit_max'], self.param_dict[param]['max'])
             else:
                 print(f'No transformation type specified for {param} dimension, attempting logistic transform')
                 mapped_data[:,pidx],_,_ = self.logistic(data[:,pidx], False, self.param_dict[param]['logit_max'], self.param_dict[param]['max'])
@@ -956,7 +1025,7 @@ class FlowModel(Model):
 
         #scales the distribution in logistic space, so that the samples can have spread O(1), easier for flow to learn
         if wholedataset:
-            max = np.max(logit_data)
+            max = np.max(np.abs([np.max(logit_data),np.min(logit_data)]))
         else:
             max = max
         logit_data /= max
@@ -991,7 +1060,8 @@ class FlowModel(Model):
             data *=rescale_max
         return(data)
 
-    def train(self, no_trans, no_neurons, no_blocks, no_bins, lr, epochs, batch_no, filepath, device):
+    def train(self, no_trans, no_neurons, no_blocks, no_bins, lr, epochs, batch_size, filepath, device,\
+        random_seed, update_every, frac_dataset_per_epoch, verbose):
         """
         Trains the normalising flow with certain configuration of flow network parameters.
         Saves these network parameters to a json config file, and saves flow post training.
@@ -1009,8 +1079,8 @@ class FlowModel(Model):
             the initial learning rate of the flow
         epochs : int
             the number of epochs which to train the flow
-        batch_no : int
-            the number of samples to use for a batch of training
+        batch_size : int
+            the size of each batch of data to use for training
         filepath : str
             the directory to save the flow models and associated config
         deivce : str
@@ -1023,11 +1093,11 @@ class FlowModel(Model):
         self.no_blocks = no_blocks
         self.no_bins = no_bins
 
-        #FIXME - make this a settable parameter
-        batch_size=10000
+        #set seed for reproducability - not all results 100% reproducable even with same seed
+        torch.manual_seed(random_seed)
 
         #initislise flow network as NFlow class
-        self.flow = NFlow(self.no_trans, self.no_neurons, self.no_blocks, self.no_bins, self.no_params, self.conditionals, batch_size, 
+        self.flow = NFlow(self.no_trans, self.no_neurons, self.no_blocks, self.no_bins, self.no_params, self.conditionals, 
                     self.total_smdls, RNVP=False, device=device)
 
         #map the training and validation samples
@@ -1039,7 +1109,7 @@ class FlowModel(Model):
 
         #set mapping parameters into channel config
         for param in self.param_dict:
-            if self.param_dict[param]['transf'] == 'logit':
+            if self.param_dict[param]['transf'] == 'logit' or self.param_dict[param]['transf'] == 'loglogit':
                 channel_config[param] = {'logit_max':self.param_dict[param]['logit_max'], 'max':self.param_dict[param]['max']}
 
         channel_json = {}
@@ -1053,6 +1123,8 @@ class FlowModel(Model):
             old_config[self.channel_label] = channel_config
             #load old config of other channels
             channel_json = old_config
+        else:
+            os.makedirs(filepath, exist_ok=True)
 
         #write this channels config to file
         with open(f'{filepath}/flowconfig.json', 'w') as f:
@@ -1060,7 +1132,7 @@ class FlowModel(Model):
 
         save_filename = f'{filepath}/{self.channel_label}'
         #train the normalising flow
-        self.flow.trainval(lr, epochs, batch_no, save_filename, training_data, val_data)
+        self.flow.trainval(lr, epochs, batch_size, save_filename, training_data, val_data, update_every, frac_dataset_per_epoch, verbose)
 
     def load_model(self, filepath, device='cpu'):
         """
@@ -1096,7 +1168,7 @@ class FlowModel(Model):
             #load parameter mapings, from config if availble, if not then try mappings.np file
             try:
                 for param in self.param_dict:
-                    if self.param_dict[param]['transf'] == 'logit':
+                    if self.param_dict[param]['transf'] == 'logit' or self.param_dict[param]['transf'] == 'loglogit':
                         for key in ['logit_max', 'max']:
                             self.param_dict[param][key] = config[self.channel_label][param][key]
             except:
@@ -1115,11 +1187,8 @@ class FlowModel(Model):
         else:
             raise Exception("no config available")
 
-        #FIXME: make this a settable parameter
-        batch_size=10000
-
         #initialise NFlow model
-        self.flow = NFlow(self.no_trans, self.no_neurons, self.no_blocks, self.no_bins, self.no_params, self.conditionals, batch_size,\
+        self.flow = NFlow(self.no_trans, self.no_neurons, self.no_blocks, self.no_bins, self.no_params, self.conditionals,\
             self.total_smdls, RNVP=False, device=device)
 
         #load in actual flow model
@@ -1139,14 +1208,10 @@ class FlowModel(Model):
             value of detection efficiency for specified hyperparameter values
         """
 
-        #reshape detection efficiency values onto grid the shape of hyperparameter values
-        hp_grid_shape = [len(self.hyperparam_models[i]) for i in range(len(self.hyperparam_models))]
-        alpha_grid = np.reshape(tuple(self.alpha.values()), (hp_grid_shape))
-
-        #initialise interpolator over hyperparameters to interolate log(detection efficiency)
-        alpha_interp = sp.interpolate.RegularGridInterpolator((self.hp_vals), np.log(alpha_grid),\
-            bounds_error=False, method='pchip', fill_value=None)
         #find alpha at specified hyperparameter values
-        alpha = np.exp(alpha_interp(hyperparams))
+        if self.deteff_nn_interp:
+            alpha = self.alpha_interp.run_on_dataset(torch.as_tensor(np.array(hyperparams)).float()).cpu().numpy()
+        else:
+            alpha = np.exp(self.alpha_interp(hyperparams))
 
         return alpha
