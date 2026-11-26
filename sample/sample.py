@@ -330,7 +330,7 @@ def lnlike(x, data, models, submodels_dict, channels, prior_pdf, \
 
     #returns lnprob summed over events (probability multiplied over events - see one channel eq D13 (now D8?) for full likelihood calc)
     if infer_rate:
-        return (lnprob-np.log(alpha)).sum() #TODO: add rate term to the end of this if using
+        return (lnprob-np.log(alpha)).sum() +  #TODO: add rate term to the end of this if using
     else: 
         return (lnprob-np.log(alpha)).sum() 
 
